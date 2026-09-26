@@ -377,7 +377,6 @@ static void buffer_insert_string(const char *s) {
     }
 
     in_paste = false;
-    paste_count = 0;
 }
 
 static void buffer_delete_char(void) {
