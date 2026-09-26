@@ -1,7 +1,8 @@
-/* ============================================================ */
-/*  nano-ar — نسخة محسّنة للأداء (v2.2)                         */
-/*  تعمل بسلاسة مع اللصق الكبير                                 */
-/* ============================================================ */
+/**************************************************************************
+ *  nano-ar v3.0 — محرر نصوص عربي شامل لـ Termux و Linux                *
+ *  ملف واحد: تلوين + إكمال + تصحيح + Undo + ثيمات + عربي                *
+ *  الرخصة: MIT                                                          *
+ **************************************************************************/
 
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -17,12 +18,17 @@
 #include <signal.h>
 #include <unistd.h>
 
+/* ============================================================ */
+/*                       الإعدادات                              */
+/* ============================================================ */
+
 #define APP_NAME     "nano-ar"
-#define APP_VERSION  "2.2.0"
+#define APP_VERSION  "3.0.0"
 #define TAB_SIZE     4
 #define MAX_LINE     4096
-#define UNDO_MAX     50      /* ★ خُفّضت */
+#define UNDO_MAX     50
 
+/* ألوان الواجهة */
 #define C_TITLE      1
 #define C_TAG        2
 #define C_ATTR       3
@@ -32,10 +38,16 @@
 #define C_KEYS       7
 #define C_LINE_NUM   8
 #define C_MODIFIED   9
+#define C_NUMBER    10
+#define C_HEADER    11
+
+/* ============================================================ */
+/*                       الهياكل                                */
+/* ============================================================ */
 
 typedef struct Line {
     char *data;
-    int alloc;               /* ★ حجم المحجوز */
+    int alloc;
     struct Line *prev;
     struct Line *next;
 } Line;
@@ -60,6 +72,16 @@ typedef struct {
     int count;
 } UndoStack;
 
+typedef enum {
+    LANG_NONE = 0,
+    LANG_HTML, LANG_CSS, LANG_JS, LANG_PYTHON,
+    LANG_C, LANG_MARKDOWN, LANG_JSON, LANG_XML
+} Language;
+
+/* ============================================================ */
+/*                    المتغيرات العامة                          */
+/* ============================================================ */
+
 static Buffer B;
 static UndoStack undo_stack;
 static int screen_rows = 24, screen_cols = 80;
@@ -67,7 +89,8 @@ static char status_msg[512] = "";
 static bool running = true;
 static char *clipboard = NULL;
 static bool show_line_numbers = true;
-static bool in_paste = false;    /* ★ وضع اللصق */
+static bool in_paste = false;
+static Language current_lang = LANG_NONE;
 
 /* التصحيح */
 static char **dictionary = NULL;
@@ -76,7 +99,10 @@ static size_t dict_cap = 0;
 static bool spell_ready = false;
 static bool hunspell_available = false;
 
-/* وسوم HTML */
+/* ============================================================ */
+/*                    وسوم HTML                                 */
+/* ============================================================ */
+
 static const char *html_tags[] = {
     "a","abbr","address","area","article","aside","audio",
     "b","base","bdi","bdo","blockquote","body","br","button",
@@ -100,8 +126,41 @@ static const char *void_tags[] = {
 };
 #define NUM_VOID_TAGS (sizeof(void_tags)/sizeof(void_tags[0]))
 
+/* كلمات مفتاحية */
+static const char *kw_css[] = {
+    "color","background","margin","padding","border","font","width",
+    "height","display","position","top","left","right","bottom",
+    "flex","grid","align","justify","transform","transition","animation",
+    "opacity","visibility","overflow","z-index","content",NULL
+};
+
+static const char *kw_js[] = {
+    "var","let","const","function","return","if","else","for","while",
+    "do","switch","case","break","continue","new","this","true","false",
+    "null","undefined","typeof","instanceof","try","catch","finally",
+    "throw","class","extends","super","import","export","from","default",
+    "async","await","yield","of","in","delete","void","with","debugger",NULL
+};
+
+static const char *kw_py[] = {
+    "def","class","return","if","elif","else","for","while","break",
+    "continue","pass","import","from","as","try","except","finally",
+    "raise","with","lambda","yield","global","nonlocal","assert","del",
+    "in","is","not","and","or","True","False","None","async","await",NULL
+};
+
+static const char *kw_c[] = {
+    "int","char","float","double","void","long","short","unsigned",
+    "signed","const","static","extern","volatile","register","if","else",
+    "for","while","do","switch","case","break","continue","return","goto",
+    "struct","union","enum","typedef","sizeof","include","define",
+    "ifdef","ifndef","endif","class","public","private","protected",
+    "virtual","template","namespace","using","new","delete","this",
+    "try","catch","throw","bool","true","false",NULL
+};
+
 /* ============================================================ */
-/*                      مساعدات                                 */
+/*                    مساعدات                                   */
 /* ============================================================ */
 
 static void *xmalloc(size_t n) {
@@ -130,14 +189,66 @@ static void set_status(const char *fmt, ...) {
     va_end(ap);
 }
 
+/* فحص كلمة مفتاحية */
+static bool is_keyword(const char *word, const char **list) {
+    for (int i = 0; list[i]; i++)
+        if (strcmp(word, list[i]) == 0) return true;
+    return false;
+}
+
 /* ============================================================ */
-/*                  إدارة المخزن                                */
+/*                    كشف اللغة                                 */
+/* ============================================================ */
+
+static Language detect_language(const char *filename) {
+    if (!filename || !filename[0]) return LANG_NONE;
+    const char *dot = strrchr(filename, '.');
+    if (!dot) return LANG_NONE;
+
+    if (!strcasecmp(dot, ".html") || !strcasecmp(dot, ".htm") ||
+        !strcasecmp(dot, ".xhtml") || !strcasecmp(dot, ".vue"))
+        return LANG_HTML;
+    if (!strcasecmp(dot, ".css") || !strcasecmp(dot, ".scss") ||
+        !strcasecmp(dot, ".sass") || !strcasecmp(dot, ".less"))
+        return LANG_CSS;
+    if (!strcasecmp(dot, ".js") || !strcasecmp(dot, ".jsx") ||
+        !strcasecmp(dot, ".ts") || !strcasecmp(dot, ".tsx") ||
+        !strcasecmp(dot, ".mjs"))
+        return LANG_JS;
+    if (!strcasecmp(dot, ".py") || !strcasecmp(dot, ".pyw"))
+        return LANG_PYTHON;
+    if (!strcasecmp(dot, ".c") || !strcasecmp(dot, ".h") ||
+        !strcasecmp(dot, ".cpp") || !strcasecmp(dot, ".hpp"))
+        return LANG_C;
+    if (!strcasecmp(dot, ".md") || !strcasecmp(dot, ".markdown"))
+        return LANG_MARKDOWN;
+    if (!strcasecmp(dot, ".json")) return LANG_JSON;
+    if (!strcasecmp(dot, ".xml") || !strcasecmp(dot, ".svg")) return LANG_XML;
+    return LANG_NONE;
+}
+
+static const char *lang_name(Language lang) {
+    switch (lang) {
+        case LANG_HTML: return "HTML";
+        case LANG_CSS: return "CSS";
+        case LANG_JS: return "JavaScript";
+        case LANG_PYTHON: return "Python";
+        case LANG_C: return "C/C++";
+        case LANG_MARKDOWN: return "Markdown";
+        case LANG_JSON: return "JSON";
+        case LANG_XML: return "XML";
+        default: return "نص";
+    }
+}
+
+/* ============================================================ */
+/*                    إدارة المخزن                              */
 /* ============================================================ */
 
 static Line *line_new(const char *data) {
     Line *l = xmalloc(sizeof(Line));
     int len = data ? strlen(data) : 0;
-    l->alloc = len + 64;                /* ★ حجز مسبق */
+    l->alloc = len + 64;
     l->data = xmalloc(l->alloc);
     if (data) strcpy(l->data, data);
     else l->data[0] = '\0';
@@ -152,6 +263,7 @@ static void buffer_init(void) {
     B.numlines = 1;
     B.filename[0] = '\0';
     B.modified = false;
+    current_lang = LANG_NONE;
 }
 
 static void buffer_free(void) {
@@ -185,7 +297,7 @@ static char *buffer_serialize(void) {
 }
 
 static void undo_push(void) {
-    if (in_paste) return;              /* ★ لا undo أثناء اللصق */
+    if (in_paste) return;
 
     if (undo_stack.count >= UNDO_MAX) {
         free(undo_stack.stack[0].text);
@@ -210,7 +322,6 @@ static void buffer_deserialize(const char *text) {
         free(l);
         l = n;
     }
-
     B.head = B.tail = NULL;
     B.numlines = 0;
 
@@ -246,10 +357,7 @@ static void buffer_deserialize(const char *text) {
 }
 
 static void do_undo(void) {
-    if (undo_stack.count <= 0) {
-        set_status("لا يوجد شيء للتراجع");
-        return;
-    }
+    if (undo_stack.count <= 0) { set_status("لا يوجد شيء للتراجع"); return; }
 
     UndoState *s = &undo_stack.stack[undo_stack.top];
     int old_cy = s->cy, old_cx = s->cx;
@@ -274,10 +382,7 @@ static void do_undo(void) {
 }
 
 static void do_redo(void) {
-    if (undo_stack.count >= UNDO_MAX) {
-        set_status("لا يوجد شيء للإعادة");
-        return;
-    }
+    if (undo_stack.count >= UNDO_MAX) { set_status("لا يوجد شيء للإعادة"); return; }
 
     int next = (undo_stack.top + 1) % UNDO_MAX;
     if (undo_stack.stack[next].text == NULL) {
@@ -329,23 +434,19 @@ static void buffer_insert_newline(void) {
     B.numlines++;
     B.modified = true;
 
-    if (!in_paste)
-        undo_push();
+    if (!in_paste) undo_push();
 }
 
-/* ★ إدراج حرف بذكاء */
 static void buffer_insert_char(int c) {
     if (c == '\n' || c == '\r' || c == KEY_ENTER) {
         buffer_insert_newline();
         return;
     }
-
     if (c < 32 || c == 127) return;
 
     Line *l = B.current;
     int len = strlen(l->data);
 
-    /* ★ حجز مضاعف لتجنب realloc متكرر */
     if (len + 2 > l->alloc) {
         l->alloc = (len + 2) * 2;
         l->data = xrealloc(l->data, l->alloc);
@@ -356,26 +457,17 @@ static void buffer_insert_char(int c) {
     B.cx++;
     B.modified = true;
 
-    /* ★ undo فقط خارج وضع اللصق */
-    if (!in_paste)
-        undo_push();
+    if (!in_paste) undo_push();
 }
 
 static void buffer_insert_string(const char *s) {
-    in_paste = true;                   /* ★ تفعيل وضع اللصق */
     undo_push();
-    in_paste = false;
     in_paste = true;
-
     while (*s) {
-        if (*s == '\n') {
-            buffer_insert_newline();
-        } else {
-            buffer_insert_char((unsigned char)*s);
-        }
+        if (*s == '\n') buffer_insert_newline();
+        else buffer_insert_char((unsigned char)*s);
         s++;
     }
-
     in_paste = false;
 }
 
@@ -439,6 +531,7 @@ static void buffer_load(const char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
         snprintf(B.filename, sizeof(B.filename), "%s", filename);
+        current_lang = detect_language(filename);
         return;
     }
 
@@ -474,16 +567,14 @@ static void buffer_load(const char *filename) {
     B.rowoff = B.coloff = 0;
     B.modified = false;
     snprintf(B.filename, sizeof(B.filename), "%s", filename);
+    current_lang = detect_language(filename);
 
     fclose(fp);
 }
 
 static void buffer_save(const char *filename) {
     FILE *fp = fopen(filename, "w");
-    if (!fp) {
-        set_status("✗ خطأ: لا يمكن الحفظ في %s", filename);
-        return;
-    }
+    if (!fp) { set_status("✗ لا يمكن الحفظ في %s", filename); return; }
 
     for (Line *l = B.head; l; l = l->next) {
         fputs(l->data, fp);
@@ -493,6 +584,7 @@ static void buffer_save(const char *filename) {
     fclose(fp);
     B.modified = false;
     snprintf(B.filename, sizeof(B.filename), "%s", filename);
+    current_lang = detect_language(filename);
     set_status("✓ تم الحفظ: %s (%d سطر)", filename, B.numlines);
 }
 
@@ -529,10 +621,8 @@ static bool spell_init(void) {
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
                 line[--len] = '\0';
             if (len == 0) continue;
-
             char *slash = strchr(line, '/');
             if (slash) *slash = '\0';
-
             if (dict_count >= dict_cap) {
                 dict_cap *= 2;
                 dictionary = xrealloc(dictionary, dict_cap * sizeof(char *));
@@ -564,7 +654,6 @@ static bool spell_check_word(const char *word) {
 static char *spell_suggest(const char *word) {
     static char result[512];
     result[0] = '\0';
-
     if (!hunspell_available) return result;
 
     char cmd[512];
@@ -631,21 +720,8 @@ static void do_spell_check(void) {
 }
 
 /* ============================================================ */
-/*                    HTML                                      */
+/*                    إكمال HTML                                */
 /* ============================================================ */
-
-static bool html_is_html_file(void) {
-    const char *dot = strrchr(B.filename, '.');
-    if (dot) {
-        if (!strcasecmp(dot, ".html") || !strcasecmp(dot, ".htm") ||
-            !strcasecmp(dot, ".xhtml") || !strcasecmp(dot, ".php") ||
-            !strcasecmp(dot, ".vue") || !strcasecmp(dot, ".jsx"))
-            return true;
-    }
-    if (B.head && strstr(B.head->data, "<!DOCTYPE")) return true;
-    if (B.head && strstr(B.head->data, "<html")) return true;
-    return false;
-}
 
 static bool tag_is_void(const char *tag) {
     for (size_t i = 0; i < NUM_VOID_TAGS; i++)
@@ -654,14 +730,13 @@ static bool tag_is_void(const char *tag) {
 }
 
 static bool html_complete(void) {
-    if (!html_is_html_file()) return false;
+    if (current_lang != LANG_HTML && current_lang != LANG_XML) return false;
 
     Line *l = B.current;
     int start = B.cx;
 
     while (start > 0 && (isalnum((unsigned char)l->data[start-1]) ||
-                         l->data[start-1] == '-' ||
-                         l->data[start-1] == '_'))
+                         l->data[start-1] == '-' || l->data[start-1] == '_'))
         start--;
 
     int fraglen = B.cx - start;
@@ -679,15 +754,11 @@ static bool html_complete(void) {
             matches[count++] = html_tags[i];
     }
 
-    if (count == 0) {
-        set_status("لا يوجد وسم يبدأ بـ '%s'", frag);
-        return true;
-    }
+    if (count == 0) { set_status("لا يوجد وسم يبدأ بـ '%s'", frag); return true; }
 
     if (count == 1) {
         const char *tag = matches[0];
         int taglen = strlen(tag);
-
         undo_push();
 
         l->data = xrealloc(l->data, strlen(l->data) - fraglen + taglen + 1);
@@ -707,7 +778,6 @@ static bool html_complete(void) {
                     strlen(l->data + B.cx) + 1);
             memcpy(l->data + B.cx, close, clen);
             B.cx += 1;
-
             set_status("✓ <%s>…</%s>", tag, tag);
         } else {
             set_status("✓ اكتمل: <%s>", tag);
@@ -719,8 +789,7 @@ static bool html_complete(void) {
     for (int i = 1; i < count; i++) {
         size_t j = 0;
         while (j < common && matches[i][j] &&
-               tolower(matches[0][j]) == tolower(matches[i][j]))
-            j++;
+               tolower(matches[0][j]) == tolower(matches[i][j])) j++;
         common = j;
     }
 
@@ -763,6 +832,356 @@ static void html_insert_skeleton(void) {
 }
 
 /* ============================================================ */
+/*                    ★ التلوين متعدد اللغات ★                  */
+/* ============================================================ */
+
+static void draw_html(const char *data, int y, int xoff) {
+    int x = -xoff;
+    bool in_tag = false, in_string = false, in_comment = false;
+    char quote = 0;
+
+    for (int i = 0; data[i]; i++) {
+        unsigned char c = data[i];
+        if (x >= 0 && x < screen_cols) {
+            int color = 0;
+
+            if (!in_comment && data[i]=='<' && data[i+1]=='!' &&
+                data[i+2]=='-' && data[i+3]=='-')
+                in_comment = true;
+
+            if (in_comment) {
+                color = C_COMMENT;
+                if (c=='-' && data[i+1]=='-' && data[i+2]=='>')
+                    in_comment = false;
+            } else if (in_string) {
+                color = C_STRING;
+                if (c == quote) in_string = false;
+            } else if (c == '<') {
+                in_tag = true; color = C_TAG;
+            } else if (c == '>' && in_tag) {
+                color = C_TAG; in_tag = false;
+            } else if (in_tag) {
+                if (c=='"' || c=='\'') {
+                    in_string = true; quote = c; color = C_STRING;
+                } else if (isalpha(c) && (i==0 || !isalpha((unsigned char)data[i-1]))) {
+                    color = C_ATTR;
+                } else color = C_TAG;
+            }
+
+            if (color) attron(COLOR_PAIR(color));
+            mvaddch(y, x, c);
+            if (color) attroff(COLOR_PAIR(color));
+        }
+        x++;
+    }
+}
+
+static void draw_css(const char *data, int y, int xoff) {
+    int x = -xoff;
+    bool in_comment = false, in_string = false;
+    char quote = 0;
+
+    for (int i = 0; data[i]; i++) {
+        unsigned char c = data[i];
+        if (x >= 0 && x < screen_cols) {
+            int color = 0;
+
+            if (!in_comment && c=='/' && data[i+1]=='*') {
+                in_comment = true; color = C_COMMENT;
+            } else if (in_comment) {
+                color = C_COMMENT;
+                if (c=='*' && data[i+1]=='/') in_comment = false;
+            } else if (in_string) {
+                color = C_STRING;
+                if (c == quote) in_string = false;
+            } else if (c=='"' || c=='\'') {
+                in_string = true; quote = c; color = C_STRING;
+            } else if (c == '{' || c == '}') {
+                color = C_HEADER;
+            } else if (c == ':' || c == ';') {
+                color = C_TAG;
+            } else if (c == '#') {
+                color = C_NUMBER;
+            } else if (isdigit(c)) {
+                color = C_NUMBER;
+            } else if (isalpha(c) && (i==0 || !isalnum((unsigned char)data[i-1]))) {
+                int wl = 0;
+                while (isalnum((unsigned char)data[i+wl]) ||
+                       data[i+wl]=='-' || data[i+wl]=='_') wl++;
+                char word[64];
+                if (wl < 64) {
+                    strncpy(word, data+i, wl);
+                    word[wl] = '\0';
+                    if (is_keyword(word, kw_css)) color = C_ATTR;
+                    else color = C_LINE_NUM;
+                }
+            }
+
+            if (color) attron(COLOR_PAIR(color));
+            mvaddch(y, x, c);
+            if (color) attroff(COLOR_PAIR(color));
+        }
+        x++;
+    }
+}
+
+static void draw_js(const char *data, int y, int xoff) {
+    int x = -xoff;
+    bool in_string = false, in_comment = false, in_line_comment = false;
+    char quote = 0;
+
+    for (int i = 0; data[i]; i++) {
+        unsigned char c = data[i];
+        if (x >= 0 && x < screen_cols) {
+            int color = 0;
+
+            if (!in_comment && !in_line_comment && !in_string &&
+                c=='/' && data[i+1]=='*') {
+                in_comment = true; color = C_COMMENT;
+            } else if (in_comment) {
+                color = C_COMMENT;
+                if (c=='*' && data[i+1]=='/') in_comment = false;
+            } else if (!in_line_comment && !in_string &&
+                       c=='/' && data[i+1]=='/') {
+                in_line_comment = true; color = C_COMMENT;
+            } else if (in_line_comment) {
+                color = C_COMMENT;
+            } else if (in_string) {
+                color = C_STRING;
+                if (c == quote && data[i-1] != '\\') in_string = false;
+            } else if (c=='"' || c=='\'' || c=='`') {
+                in_string = true; quote = c; color = C_STRING;
+            } else if (isdigit(c)) {
+                color = C_NUMBER;
+            } else if (isalpha(c) && (i==0 || !isalnum((unsigned char)data[i-1]))) {
+                int wl = 0;
+                while (isalnum((unsigned char)data[i+wl]) ||
+                       data[i+wl]=='_' || data[i+wl]=='$') wl++;
+                char word[64];
+                if (wl < 64) {
+                    strncpy(word, data+i, wl);
+                    word[wl] = '\0';
+                    if (is_keyword(word, kw_js)) color = C_TAG;
+                    else color = C_LINE_NUM;
+                }
+            }
+
+            if (color) attron(COLOR_PAIR(color));
+            mvaddch(y, x, c);
+            if (color) attroff(COLOR_PAIR(color));
+        }
+        x++;
+    }
+}
+
+static void draw_python(const char *data, int y, int xoff) {
+    int x = -xoff;
+    bool in_string = false, in_comment = false;
+    char quote = 0;
+    int triple = 0;
+
+    for (int i = 0; data[i]; i++) {
+        unsigned char c = data[i];
+        if (x >= 0 && x < screen_cols) {
+            int color = 0;
+
+            if (!in_string && c == '#') {
+                in_comment = true; color = C_COMMENT;
+            } else if (in_comment) {
+                color = C_COMMENT;
+            } else if (in_string) {
+                color = C_STRING;
+                if (c == quote) {
+                    if (triple == 3 && data[i+1]==quote && data[i+2]==quote) {
+                        triple = 0; in_string = false;
+                    } else if (triple == 1) in_string = false;
+                }
+            } else if (c=='"' || c=='\'') {
+                if (data[i+1]==c && data[i+2]==c) {
+                    triple = 3; in_string = true; quote = c; color = C_STRING;
+                } else {
+                    triple = 1; in_string = true; quote = c; color = C_STRING;
+                }
+            } else if (isdigit(c)) {
+                color = C_NUMBER;
+            } else if (isalpha(c) && (i==0 || !isalnum((unsigned char)data[i-1]))) {
+                int wl = 0;
+                while (isalnum((unsigned char)data[i+wl]) ||
+                       data[i+wl]=='_') wl++;
+                char word[64];
+                if (wl < 64) {
+                    strncpy(word, data+i, wl);
+                    word[wl] = '\0';
+                    if (is_keyword(word, kw_py)) color = C_TAG;
+                    else color = C_LINE_NUM;
+                }
+            }
+
+            if (color) attron(COLOR_PAIR(color));
+            mvaddch(y, x, c);
+            if (color) attroff(COLOR_PAIR(color));
+        }
+        x++;
+    }
+}
+
+static void draw_c(const char *data, int y, int xoff) {
+    int x = -xoff;
+    bool in_string = false, in_char = false;
+    bool in_comment = false, in_line_comment = false;
+    char quote = 0;
+
+    for (int i = 0; data[i]; i++) {
+        unsigned char c = data[i];
+        if (x >= 0 && x < screen_cols) {
+            int color = 0;
+
+            if (!in_comment && !in_line_comment && !in_string && !in_char &&
+                c=='/' && data[i+1]=='*') {
+                in_comment = true; color = C_COMMENT;
+            } else if (in_comment) {
+                color = C_COMMENT;
+                if (c=='*' && data[i+1]=='/') in_comment = false;
+            } else if (!in_line_comment && !in_string && !in_char &&
+                       c=='/' && data[i+1]=='/') {
+                in_line_comment = true; color = C_COMMENT;
+            } else if (in_line_comment) {
+                color = C_COMMENT;
+            } else if (in_string || in_char) {
+                color = C_STRING;
+                if (c == quote && data[i-1] != '\\')
+                    in_string = in_char = false;
+            } else if (c == '"') {
+                in_string = true; quote = c; color = C_STRING;
+            } else if (c == '\'') {
+                in_char = true; quote = c; color = C_STRING;
+            } else if (c == '#') {
+                color = C_COMMENT; in_line_comment = true;
+            } else if (isdigit(c)) {
+                color = C_NUMBER;
+            } else if (isalpha(c) && (i==0 || !isalnum((unsigned char)data[i-1]))) {
+                int wl = 0;
+                while (isalnum((unsigned char)data[i+wl]) ||
+                       data[i+wl]=='_') wl++;
+                char word[64];
+                if (wl < 64) {
+                    strncpy(word, data+i, wl);
+                    word[wl] = '\0';
+                    if (is_keyword(word, kw_c)) color = C_TAG;
+                    else color = C_LINE_NUM;
+                }
+            }
+
+            if (color) attron(COLOR_PAIR(color));
+            mvaddch(y, x, c);
+            if (color) attroff(COLOR_PAIR(color));
+        }
+        x++;
+    }
+}
+
+static void draw_markdown(const char *data, int y, int xoff) {
+    int x = -xoff;
+    bool in_code = false;
+
+    bool is_header = false;
+    for (int i = 0; data[i] == '#' && i < 6; i++) is_header = true;
+
+    for (int i = 0; data[i]; i++) {
+        unsigned char c = data[i];
+        if (x >= 0 && x < screen_cols) {
+            int color = 0;
+
+            if (c == '`') {
+                in_code = !in_code; color = C_STRING;
+            } else if (in_code) {
+                color = C_STRING;
+            } else if (is_header) {
+                color = C_HEADER;
+            } else if (c == '*' || c == '_') {
+                color = C_ATTR;
+            } else if (c == '[' || c == ']' || c == '(' || c == ')') {
+                color = C_TAG;
+            }
+
+            if (color) attron(COLOR_PAIR(color) | A_BOLD);
+            mvaddch(y, x, c);
+            if (color) attroff(COLOR_PAIR(color) | A_BOLD);
+        }
+        x++;
+    }
+}
+
+static void draw_json(const char *data, int y, int xoff) {
+    int x = -xoff;
+    bool in_string = false, in_escape = false, is_key = false;
+
+    for (int i = 0; data[i]; i++) {
+        unsigned char c = data[i];
+        if (x >= 0 && x < screen_cols) {
+            int color = 0;
+
+            if (in_escape) {
+                in_escape = false; color = C_STRING;
+            } else if (in_string) {
+                if (c == '\\') { in_escape = true; color = C_STRING; }
+                else if (c == '"') {
+                    in_string = false;
+                    int j = i + 1;
+                    while (data[j] == ' ' || data[j] == '\t') j++;
+                    color = (data[j] == ':') ? C_ATTR : C_STRING;
+                } else color = is_key ? C_ATTR : C_STRING;
+            } else if (c == '"') {
+                in_string = true;
+                int j = i + 1;
+                while (data[j] && data[j] != '"') j++;
+                if (data[j] == '"') {
+                    j++;
+                    while (data[j] == ' ' || data[j] == '\t') j++;
+                    is_key = (data[j] == ':');
+                }
+                color = is_key ? C_ATTR : C_STRING;
+            } else if (isdigit(c) || c == '-') {
+                color = C_NUMBER;
+            } else if (c=='{' || c=='}' || c=='[' || c==']' ||
+                       c==':' || c==',') {
+                color = C_TAG;
+            } else if (c=='t' || c=='f' || c=='n') {
+                color = C_TAG;
+            }
+
+            if (color) attron(COLOR_PAIR(color));
+            mvaddch(y, x, c);
+            if (color) attroff(COLOR_PAIR(color));
+        }
+        x++;
+    }
+}
+
+/* ★ الرسم الرئيسي حسب اللغة */
+static void draw_syntax_line(const char *data, int y, int xoff) {
+    switch (current_lang) {
+        case LANG_HTML:
+        case LANG_XML:      draw_html(data, y, xoff); break;
+        case LANG_CSS:      draw_css(data, y, xoff); break;
+        case LANG_JS:       draw_js(data, y, xoff); break;
+        case LANG_PYTHON:   draw_python(data, y, xoff); break;
+        case LANG_C:        draw_c(data, y, xoff); break;
+        case LANG_MARKDOWN: draw_markdown(data, y, xoff); break;
+        case LANG_JSON:     draw_json(data, y, xoff); break;
+        default: {
+            int len = strlen(data);
+            int x = -xoff;
+            for (int i = 0; i < len && x < screen_cols; i++) {
+                if (x >= 0) mvaddch(y, x, data[i]);
+                x++;
+            }
+            break;
+        }
+    }
+}
+
+/* ============================================================ */
 /*                    الواجهة                                   */
 /* ============================================================ */
 
@@ -779,63 +1198,8 @@ static void init_colors(void) {
         init_pair(C_KEYS,      COLOR_WHITE,  COLOR_BLUE);
         init_pair(C_LINE_NUM,  COLOR_YELLOW, -1);
         init_pair(C_MODIFIED,  COLOR_RED,    -1);
-    }
-}
-
-static void draw_html_line(const char *data, int y, int xoff) {
-    int x = -xoff;
-    bool in_tag = false, in_string = false, in_comment = false;
-    char quote = 0;
-
-    for (int i = 0; data[i]; i++) {
-        unsigned char c = data[i];
-
-        if (x >= 0 && x < screen_cols) {
-            int color = 0;
-
-            if (!in_comment && data[i] == '<' && data[i+1] == '!' &&
-                data[i+2] == '-' && data[i+3] == '-')
-                in_comment = true;
-
-            if (in_comment) {
-                color = C_COMMENT;
-                if (c == '-' && data[i+1] == '-' && data[i+2] == '>')
-                    in_comment = false;
-            } else if (in_string) {
-                color = C_STRING;
-                if (c == quote) in_string = false;
-            } else if (c == '<') {
-                in_tag = true;
-                color = C_TAG;
-            } else if (c == '>' && in_tag) {
-                color = C_TAG;
-                in_tag = false;
-            } else if (in_tag) {
-                if (c == '"' || c == '\'') {
-                    in_string = true;
-                    quote = c;
-                    color = C_STRING;
-                } else if (isalpha(c) && (i == 0 || !isalpha((unsigned char)data[i-1]))) {
-                    color = C_ATTR;
-                } else {
-                    color = C_TAG;
-                }
-            }
-
-            if (color) attron(COLOR_PAIR(color));
-            mvaddch(y, x, c);
-            if (color) attroff(COLOR_PAIR(color));
-        }
-        x++;
-    }
-}
-
-static void draw_plain_line(const char *data, int y, int xoff) {
-    int len = strlen(data);
-    int x = -xoff;
-    for (int i = 0; i < len && x < screen_cols; i++) {
-        if (x >= 0) mvaddch(y, x, data[i]);
-        x++;
+        init_pair(C_NUMBER,    COLOR_MAGENTA, -1);
+        init_pair(C_HEADER,    COLOR_CYAN,   -1);
     }
 }
 
@@ -850,7 +1214,7 @@ static void ui_draw_title(void) {
     const char *fname = B.filename[0] ? B.filename : "[بدون اسم]";
     int flen = strlen(fname);
     int fx = (screen_cols - flen - 3) / 2;
-    if (fx < 20) fx = 20;
+    if (fx < 25) fx = 25;
     if (fx + flen + 2 < screen_cols) {
         mvprintw(0, fx, " %s ", fname);
         if (B.modified) {
@@ -863,7 +1227,8 @@ static void ui_draw_title(void) {
     }
 
     char right[64];
-    snprintf(right, sizeof(right), " %d:%d ", B.cy + 1, B.cx + 1);
+    snprintf(right, sizeof(right), " %s | %d:%d ",
+             lang_name(current_lang), B.cy + 1, B.cx + 1);
     int rlen = strlen(right);
     if (screen_cols > rlen + 2)
         mvprintw(0, screen_cols - rlen - 1, "%s", right);
@@ -880,7 +1245,7 @@ static void ui_draw_status(void) {
     snprintf(info, sizeof(info), " %s | %d سطر | %s | UTF-8 ",
              B.modified ? "● معدّل" : "○ محفوظ",
              B.numlines,
-             html_is_html_file() ? "HTML" : "نص");
+             lang_name(current_lang));
 
     mvprintw(y, 0, "%.*s", screen_cols, info);
     attroff(COLOR_PAIR(C_STATUS));
@@ -930,7 +1295,6 @@ static void ui_draw(void) {
     for (int i = 0; i < B.rowoff && l; i++) l = l->next;
 
     int y = edit_top;
-    bool is_html = html_is_html_file();
     int lineno = B.rowoff + 1;
 
     while (l && y <= edit_bottom) {
@@ -942,10 +1306,8 @@ static void ui_draw(void) {
             attroff(COLOR_PAIR(C_LINE_NUM) | A_DIM);
         }
 
-        if (is_html)
-            draw_html_line(l->data, y, B.coloff - num_width);
-        else
-            draw_plain_line(l->data, y, B.coloff - num_width);
+        /* ★ استخدام الرسم حسب اللغة */
+        draw_syntax_line(l->data, y, B.coloff - num_width);
 
         l = l->next;
         y++;
@@ -1017,8 +1379,7 @@ static void do_exit(void) {
 static void do_search(void) {
     char query[256];
     echo();
-    move(screen_rows - 1, 0);
-    clrtoeol();
+    move(screen_rows - 1, 0); clrtoeol();
     mvprintw(screen_rows - 1, 0, " 🔍 بحث: ");
     getnstr(query, sizeof(query) - 1);
     noecho();
@@ -1046,13 +1407,10 @@ static void do_search(void) {
         line_no++;
         if (!l) {
             if (wrapped) break;
-            l = B.head;
-            line_no = 0;
-            wrapped = true;
+            l = B.head; line_no = 0; wrapped = true;
         }
         if (l == start && wrapped) break;
     }
-
     set_status("✗ لم يوجد: %s", query);
 }
 
@@ -1071,7 +1429,6 @@ static void do_replace(void) {
 
     int count = 0;
     int flen = strlen(find), rlen = strlen(repl);
-
     undo_push();
 
     for (Line *l = B.head; l; l = l->next) {
@@ -1084,7 +1441,6 @@ static void do_replace(void) {
             count++;
         }
     }
-
     B.modified = (count > 0);
     set_status("✓ تم استبدال %d حالة", count);
 }
@@ -1104,9 +1460,7 @@ static void do_goto_line(void) {
     int i = 0;
     while (l && i < target) { l = l->next; i++; }
     if (l) {
-        B.current = l;
-        B.cy = i;
-        B.cx = 0;
+        B.current = l; B.cy = i; B.cx = 0;
         ui_scroll();
         set_status("✓ السطر %d", i + 1);
     }
@@ -1114,7 +1468,6 @@ static void do_goto_line(void) {
 
 static void do_help(void) {
     erase();
-
     attron(COLOR_PAIR(C_TITLE) | A_BOLD);
     mvhline(1, 2, ' ', screen_cols - 4);
     mvprintw(1, 4, " %s v%s — المساعدة ", APP_NAME, APP_VERSION);
@@ -1126,7 +1479,7 @@ static void do_help(void) {
         "  ^O    حفظ",
         "  ^W    بحث",
         "  ^\\    بحث واستبدال",
-        "  ^V    لصق نص",
+        "  ^V    لصق نص كبير",
         "  ^G    اذهب إلى سطر",
         "  ^T    تصحيح إملائي",
         "  ^Z    تراجع",
@@ -1134,9 +1487,11 @@ static void do_help(void) {
         "  ^K    قطع السطر",
         "  ^U    لصق",
         "  ^C    موقع المؤشر",
-        "  ^L    إظهار/إخفاء أرقام الأسطر",
-        "  Tab   إكمال وسم HTML",
+        "  ^L    أرقام الأسطر",
+        "  Tab   إكمال HTML (في ملفات .html)",
         "  F2    إدراج هيكل HTML5",
+        "",
+        "  اللغات المدعومة: HTML, CSS, JS, Python, C, MD, JSON, XML",
         "",
         "  اضغط أي مفتاح للعودة...",
         NULL
@@ -1162,10 +1517,7 @@ static void do_cut_line(void) {
 }
 
 static void do_paste(void) {
-    if (!clipboard) {
-        set_status("⚠ لا يوجد شيء للصق");
-        return;
-    }
+    if (!clipboard) { set_status("⚠ لا يوجد شيء للصق"); return; }
     buffer_insert_string(clipboard);
     set_status("✓ تم اللصق");
 }
@@ -1180,13 +1532,12 @@ static void do_toggle_numbers(void) {
     set_status("%s أرقام الأسطر", show_line_numbers ? "✓" : "✗");
 }
 
-/* ★ لصق نص كامل دفعة واحدة */
 static void do_paste_text(void) {
     echo();
     curs_set(1);
     move(screen_rows - 1, 0);
     clrtoeol();
-    printw(" الصق النص هنا ثم Enter: ");
+    printw(" الصق النص ثم Enter: ");
     refresh();
 
     char *buf = xmalloc(4096);
@@ -1196,30 +1547,23 @@ static void do_paste_text(void) {
     while ((ch = getch()) != '\n' && ch != KEY_ENTER) {
         if (ch == 27) break;
         if (ch == KEY_BACKSPACE && len > 0) { len--; continue; }
-        if (len + 2 >= cap) {
-            cap *= 2;
-            buf = xrealloc(buf, cap);
-        }
+        if (len + 2 >= cap) { cap *= 2; buf = xrealloc(buf, cap); }
         buf[len++] = (char)ch;
     }
     buf[len] = '\0';
     noecho();
 
     if (len > 0) {
-        /* ★ وضع اللصق: undo واحد فقط */
         undo_push();
         in_paste = true;
-
         for (size_t i = 0; i < len; i++) {
             if (buf[i] == '\n') buffer_insert_newline();
             else if ((unsigned char)buf[i] >= 32)
                 buffer_insert_char(buf[i]);
         }
-
         in_paste = false;
         set_status("✓ تم لصق %zu حرف", len);
     }
-
     free(buf);
 }
 
@@ -1239,7 +1583,7 @@ static void process_key(int c) {
         case 15: do_save(); break;
         case 23: do_search(); break;
         case 28: do_replace(); break;
-        case 22: do_paste_text(); break;      /* ^V لصق كبير */
+        case 22: do_paste_text(); break;
         case 7:  do_goto_line(); break;
         case 20: do_spell_check(); break;
         case 26: do_undo(); break;
@@ -1328,7 +1672,6 @@ static void process_key(int c) {
                 buffer_insert_char(c);
             break;
     }
-
     ui_scroll();
 }
 
@@ -1336,10 +1679,7 @@ static void process_key(int c) {
 /*                    main                                      */
 /* ============================================================ */
 
-static void handle_sigint(int sig) {
-    (void)sig;
-    running = false;
-}
+static void handle_sigint(int sig) { (void)sig; running = false; }
 
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
