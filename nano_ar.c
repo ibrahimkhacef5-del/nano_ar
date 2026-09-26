@@ -1,5 +1,6 @@
 /**************************************************************************
- *  nano-ar — محرر نصوص عربي خفيف يعمل على Termux و Linux              *
+ *  nano-ar v2.0 — محرر نصوص عربي لـ Termux                             *
+ *  واجهة محدثة + Enter يعمل + تلوين + تصحيح + إكمال HTML                *
  *  الرخصة: MIT                                                          *
  **************************************************************************/
 
@@ -17,16 +18,31 @@
 #include <signal.h>
 #include <unistd.h>
 
+/* ============================================================ */
+/*                       الإعدادات                              */
+/* ============================================================ */
+
 #define APP_NAME     "nano-ar"
-#define APP_VERSION  "1.0.0"
+#define APP_VERSION  "2.0.0"
 #define TAB_SIZE     4
 #define MAX_LINE     4096
 #define UNDO_MAX     200
-#define COLOR_TAG    1
-#define COLOR_ATTR   2
-#define COLOR_STRING 3
-#define COLOR_COMMENT 4
-#define COLOR_MATCH  5
+
+/* ألوان الواجهة */
+#define C_TITLE      1
+#define C_TAG        2
+#define C_ATTR       3
+#define C_STRING     4
+#define C_COMMENT    5
+#define C_STATUS     6
+#define C_KEYS       7
+#define C_FRAME      8
+#define C_LINE_NUM   9
+#define C_MODIFIED  10
+
+/* ============================================================ */
+/*                       الهياكل                                */
+/* ============================================================ */
 
 typedef struct Line {
     char *data;
@@ -54,18 +70,28 @@ typedef struct {
     int count;
 } UndoStack;
 
+/* ============================================================ */
+/*                    المتغيرات العامة                          */
+/* ============================================================ */
+
 static Buffer B;
 static UndoStack undo_stack;
 static int screen_rows = 24, screen_cols = 80;
 static char status_msg[512] = "";
 static bool running = true;
 static char *clipboard = NULL;
+static bool show_line_numbers = true;
 
+/* التصحيح */
 static char **dictionary = NULL;
 static size_t dict_count = 0;
 static size_t dict_cap = 0;
 static bool spell_ready = false;
 static bool hunspell_available = false;
+
+/* ============================================================ */
+/*                    وسوم HTML                                 */
+/* ============================================================ */
 
 static const char *html_tags[] = {
     "a","abbr","address","area","article","aside","audio",
@@ -90,6 +116,10 @@ static const char *void_tags[] = {
 };
 #define NUM_VOID_TAGS (sizeof(void_tags)/sizeof(void_tags[0]))
 
+/* ============================================================ */
+/*                    مساعدات                                   */
+/* ============================================================ */
+
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
     if (!p) { endwin(); fprintf(stderr, "Out of memory\n"); exit(1); }
@@ -108,6 +138,17 @@ static char *xstrdup(const char *s) {
     strcpy(p, s);
     return p;
 }
+
+static void set_status(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(status_msg, sizeof(status_msg), fmt, ap);
+    va_end(ap);
+}
+
+/* ============================================================ */
+/*                    إدارة المخزن                              */
+/* ============================================================ */
 
 static Line *line_new(const char *data) {
     Line *l = xmalloc(sizeof(Line));
@@ -135,6 +176,10 @@ static void buffer_free(void) {
     }
     B.head = B.tail = B.current = NULL;
 }
+
+/* ============================================================ */
+/*                    Undo / Redo                               */
+/* ============================================================ */
 
 static char *buffer_serialize(void) {
     size_t total = 0;
@@ -212,20 +257,20 @@ static void buffer_deserialize(const char *text) {
 
 static void do_undo(void) {
     if (undo_stack.count <= 0) {
-        snprintf(status_msg, sizeof(status_msg), "لا يوجد شيء للتراجع");
+        set_status("لا يوجد شيء للتراجع");
         return;
     }
 
     UndoState *s = &undo_stack.stack[undo_stack.top];
+    int old_cy = s->cy, old_cx = s->cx;
     buffer_deserialize(s->text);
-    B.cx = s->cx;
-    B.cy = s->cy;
 
     Line *l = B.head;
-    for (int i = 0; i < s->cy && l; i++) l = l->next;
+    for (int i = 0; i < old_cy && l; i++) l = l->next;
     if (l) {
         B.current = l;
-        B.cx = s->cx;
+        B.cy = old_cy;
+        B.cx = old_cx;
         int len = strlen(l->data);
         if (B.cx > len) B.cx = len;
     }
@@ -235,31 +280,31 @@ static void do_undo(void) {
     undo_stack.top = (undo_stack.top - 1 + UNDO_MAX) % UNDO_MAX;
     undo_stack.count--;
     B.modified = true;
-    snprintf(status_msg, sizeof(status_msg), "تم التراجع");
+    set_status("↶ تم التراجع");
 }
 
 static void do_redo(void) {
     if (undo_stack.count >= UNDO_MAX) {
-        snprintf(status_msg, sizeof(status_msg), "لا يوجد شيء للإعادة");
+        set_status("لا يوجد شيء للإعادة");
         return;
     }
 
     int next = (undo_stack.top + 1) % UNDO_MAX;
     if (undo_stack.stack[next].text == NULL) {
-        snprintf(status_msg, sizeof(status_msg), "لا يوجد شيء للإعادة");
+        set_status("لا يوجد شيء للإعادة");
         return;
     }
 
     UndoState *s = &undo_stack.stack[next];
+    int old_cy = s->cy, old_cx = s->cx;
     buffer_deserialize(s->text);
-    B.cx = s->cx;
-    B.cy = s->cy;
 
     Line *l = B.head;
-    for (int i = 0; i < s->cy && l; i++) l = l->next;
+    for (int i = 0; i < old_cy && l; i++) l = l->next;
     if (l) {
         B.current = l;
-        B.cx = s->cx;
+        B.cy = old_cy;
+        B.cx = old_cx;
         int len = strlen(l->data);
         if (B.cx > len) B.cx = len;
     }
@@ -267,32 +312,43 @@ static void do_redo(void) {
     undo_stack.top = next;
     undo_stack.count++;
     B.modified = true;
-    snprintf(status_msg, sizeof(status_msg), "تم الإعادة");
+    set_status("↷ تم الإعادة");
+}
+
+/* ============================================================ */
+/*                    عمليات التحرير                            */
+/* ============================================================ */
+
+/* ★ دالة السطر الجديد — مُصلَحة */
+static void buffer_insert_newline(void) {
+    Line *l = B.current;
+    char *right = xstrdup(l->data + B.cx);
+    l->data[B.cx] = '\0';
+
+    Line *nl = line_new(right);
+    free(right);
+
+    nl->next = l->next;
+    nl->prev = l;
+    if (l->next) l->next->prev = nl;
+    else B.tail = nl;
+    l->next = nl;
+
+    B.current = nl;
+    B.cx = 0;
+    B.cy++;
+    B.numlines++;
+    B.modified = true;
+    undo_push();
 }
 
 static void buffer_insert_char(int c) {
-    if (c == '\n' || c == '\r') {
-        Line *l = B.current;
-        char *right = xstrdup(l->data + B.cx);
-        l->data[B.cx] = '\0';
-
-        Line *nl = line_new(right);
-        free(right);
-
-        nl->next = l->next;
-        nl->prev = l;
-        if (l->next) l->next->prev = nl;
-        else B.tail = nl;
-        l->next = nl;
-
-        B.current = nl;
-        B.cx = 0;
-        B.cy++;
-        B.numlines++;
-        B.modified = true;
-        undo_push();
+    /* ★ معالجة Enter بكل أشكاله */
+    if (c == '\n' || c == '\r' || c == KEY_ENTER || c == 10 || c == 13) {
+        buffer_insert_newline();
         return;
     }
+
     if (c < 32 || c == 127) return;
 
     Line *l = B.current;
@@ -308,7 +364,10 @@ static void buffer_insert_char(int c) {
 static void buffer_insert_string(const char *s) {
     undo_push();
     while (*s) {
-        buffer_insert_char((unsigned char)*s);
+        if (*s == '\n')
+            buffer_insert_newline();
+        else
+            buffer_insert_char((unsigned char)*s);
         s++;
     }
 }
@@ -365,6 +424,10 @@ static void buffer_backspace(void) {
     }
 }
 
+/* ============================================================ */
+/*                    ملفات                                     */
+/* ============================================================ */
+
 static void buffer_load(const char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
@@ -411,7 +474,7 @@ static void buffer_load(const char *filename) {
 static void buffer_save(const char *filename) {
     FILE *fp = fopen(filename, "w");
     if (!fp) {
-        snprintf(status_msg, sizeof(status_msg), "خطأ: لا يمكن الحفظ في %s", filename);
+        set_status("✗ خطأ: لا يمكن الحفظ في %s", filename);
         return;
     }
 
@@ -423,9 +486,12 @@ static void buffer_save(const char *filename) {
     fclose(fp);
     B.modified = false;
     snprintf(B.filename, sizeof(B.filename), "%s", filename);
-    snprintf(status_msg, sizeof(status_msg),
-             "✓ تم الحفظ: %s (%d سطر)", filename, B.numlines);
+    set_status("✓ تم الحفظ: %s (%d سطر)", filename, B.numlines);
 }
+
+/* ============================================================ */
+/*                    التصحيح                                   */
+/* ============================================================ */
 
 static bool spell_init(void) {
     FILE *fp = popen("command -v hunspell 2>/dev/null", "r");
@@ -517,8 +583,7 @@ static char *spell_suggest(const char *word) {
 
 static void do_spell_check(void) {
     if (!spell_ready) {
-        snprintf(status_msg, sizeof(status_msg),
-                 "التصحيح غير متاح — ثبّت: pkg install hunspell hunspell-en");
+        set_status("⚠ التصحيح غير متاح — pkg install hunspell hunspell-en");
         return;
     }
 
@@ -552,22 +617,21 @@ static void do_spell_check(void) {
     }
 
     if (errors == 0) {
-        snprintf(status_msg, sizeof(status_msg), "✓ لا توجد أخطاء إملائية");
+        set_status("✓ لا توجد أخطاء إملائية");
     } else if (first_sugg[0]) {
-        snprintf(status_msg, sizeof(status_msg),
-                 "أخطاء: %d | مثال: '%s' → %s",
-                 errors, first_word, first_sugg);
+        set_status("⚠ أخطاء: %d | '%s' → %s", errors, first_word, first_sugg);
     } else {
-        snprintf(status_msg, sizeof(status_msg),
-                 "أخطاء إملائية: %d | مثال: '%s'",
-                 errors, first_word);
+        set_status("⚠ أخطاء إملائية: %d | مثال: '%s'", errors, first_word);
     }
     free(text);
 }
 
+/* ============================================================ */
+/*                    HTML                                      */
+/* ============================================================ */
+
 static bool html_is_html_file(void) {
-    const char *name = B.filename;
-    const char *dot = strrchr(name, '.');
+    const char *dot = strrchr(B.filename, '.');
     if (dot) {
         if (!strcasecmp(dot, ".html") || !strcasecmp(dot, ".htm") ||
             !strcasecmp(dot, ".xhtml") || !strcasecmp(dot, ".php") ||
@@ -612,8 +676,7 @@ static bool html_complete(void) {
     }
 
     if (count == 0) {
-        snprintf(status_msg, sizeof(status_msg),
-                 "لا يوجد وسم يبدأ بـ '%s'", frag);
+        set_status("لا يوجد وسم يبدأ بـ '%s'", frag);
         return true;
     }
 
@@ -639,12 +702,11 @@ static bool html_complete(void) {
             memmove(l->data + B.cx + clen, l->data + B.cx,
                     strlen(l->data + B.cx) + 1);
             memcpy(l->data + B.cx, close, clen);
-
             B.cx += 1;
-            snprintf(status_msg, sizeof(status_msg),
-                     "<%s>…</%s> (المؤشر داخل الوسم)", tag, tag);
+
+            set_status("✓ <%s>…</%s>", tag, tag);
         } else {
-            snprintf(status_msg, sizeof(status_msg), "اكتمل: <%s>", tag);
+            set_status("✓ اكتمل: <%s>", tag);
         }
         return true;
     }
@@ -674,7 +736,7 @@ static bool html_complete(void) {
         if (i > 0) strcat(list, " ");
         strcat(list, matches[i]);
     }
-    snprintf(status_msg, sizeof(status_msg), "خيارات: %s", list);
+    set_status("خيارات: %s", list);
     return true;
 }
 
@@ -693,9 +755,31 @@ static void html_insert_skeleton(void) {
         "</html>";
 
     buffer_insert_string(skeleton);
-    snprintf(status_msg, sizeof(status_msg), "✓ تم إدراج هيكل HTML5");
+    set_status("✓ تم إدراج هيكل HTML5");
 }
 
+/* ============================================================ */
+/*                    ★★★ واجهة جديدة ★★★                      */
+/* ============================================================ */
+
+static void init_colors(void) {
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+        init_pair(C_TITLE,     COLOR_BLACK,  COLOR_CYAN);
+        init_pair(C_TAG,       COLOR_CYAN,   -1);
+        init_pair(C_ATTR,      COLOR_YELLOW, -1);
+        init_pair(C_STRING,    COLOR_GREEN,  -1);
+        init_pair(C_COMMENT,   COLOR_BLUE,   -1);
+        init_pair(C_STATUS,    COLOR_BLACK,  COLOR_WHITE);
+        init_pair(C_KEYS,      COLOR_WHITE,  COLOR_BLUE);
+        init_pair(C_FRAME,     COLOR_CYAN,   -1);
+        init_pair(C_LINE_NUM,  COLOR_YELLOW, -1);
+        init_pair(C_MODIFIED,  COLOR_RED,    -1);
+    }
+}
+
+/* رسم سطر HTML بتلوين */
 static void draw_html_line(const char *data, int y, int xoff) {
     int x = -xoff;
     bool in_tag = false;
@@ -714,27 +798,27 @@ static void draw_html_line(const char *data, int y, int xoff) {
                 in_comment = true;
 
             if (in_comment) {
-                color = COLOR_COMMENT;
+                color = C_COMMENT;
                 if (c == '-' && data[i+1] == '-' && data[i+2] == '>')
                     in_comment = false;
             } else if (in_string) {
-                color = COLOR_STRING;
+                color = C_STRING;
                 if (c == quote) in_string = false;
             } else if (c == '<') {
                 in_tag = true;
-                color = COLOR_TAG;
+                color = C_TAG;
             } else if (c == '>' && in_tag) {
-                color = COLOR_TAG;
+                color = C_TAG;
                 in_tag = false;
             } else if (in_tag) {
                 if (c == '"' || c == '\'') {
                     in_string = true;
                     quote = c;
-                    color = COLOR_STRING;
+                    color = C_STRING;
                 } else if (isalpha(c) && (i == 0 || !isalpha((unsigned char)data[i-1]))) {
-                    color = COLOR_ATTR;
+                    color = C_ATTR;
                 } else {
-                    color = COLOR_TAG;
+                    color = C_TAG;
                 }
             }
 
@@ -746,91 +830,188 @@ static void draw_html_line(const char *data, int y, int xoff) {
     }
 }
 
-static void ui_move_cursor(void);
-
-static void ui_draw_status(void) {
-    attron(A_REVERSE);
-    mvhline(screen_rows - 2, 0, ' ', screen_cols);
-
-    char info[512];
-    snprintf(info, sizeof(info),
-             " %s %s | %s%s | سطر %d/%d | عمود %d ",
-             APP_NAME, APP_VERSION,
-             B.filename[0] ? B.filename : "[بدون اسم]",
-             B.modified ? " *" : "",
-             B.cy + 1, B.numlines, B.cx + 1);
-
-    mvprintw(screen_rows - 2, 0, "%.*s", screen_cols, info);
-    attroff(A_REVERSE);
+/* رسم سطر عادي */
+static void draw_plain_line(const char *data, int y, int xoff) {
+    int len = strlen(data);
+    int x = -xoff;
+    for (int i = 0; i < len && x < screen_cols; i++) {
+        if (x >= 0) mvaddch(y, x, data[i]);
+        x++;
+    }
 }
 
-static void ui_draw_message(void) {
-    attron(A_BOLD);
-    mvhline(screen_rows - 1, 0, ' ', screen_cols);
+/* ★ شريط العنوان الجديد */
+static void ui_draw_title(void) {
+    attron(COLOR_PAIR(C_TITLE) | A_BOLD);
+    mvhline(0, 0, ' ', screen_cols);
 
-    const char *keys = "^X خروج  ^O حفظ  ^W بحث  ^T تصحيح  ^G سطر  ^Z تراجع  ^Y إعادة  Tab إكمال";
-    int klen = strlen(keys);
+    /* يسار: اسم التطبيق */
+    char left[128];
+    snprintf(left, sizeof(left), " %s v%s ", APP_NAME, APP_VERSION);
+    mvprintw(0, 0, "%s", left);
 
-    if (status_msg[0]) {
-        mvprintw(screen_rows - 1, 0, "%.*s", screen_cols, status_msg);
-    } else if (klen < screen_cols) {
-        mvprintw(screen_rows - 1, screen_cols - klen - 1, "%s", keys);
+    /* وسط: اسم الملف */
+    const char *fname = B.filename[0] ? B.filename : "[بدون اسم]";
+    int flen = strlen(fname);
+    int fx = (screen_cols - flen - 3) / 2;
+    if (fx < 20) fx = 20;
+    if (fx + flen + 2 < screen_cols) {
+        mvprintw(0, fx, " %s ", fname);
+        if (B.modified) {
+            attroff(COLOR_PAIR(C_TITLE) | A_BOLD);
+            attron(COLOR_PAIR(C_MODIFIED) | A_BOLD);
+            mvprintw(0, fx + flen + 2, "*");
+            attroff(COLOR_PAIR(C_MODIFIED) | A_BOLD);
+            attron(COLOR_PAIR(C_TITLE) | A_BOLD);
+        }
     }
 
-    attroff(A_BOLD);
+    /* يمين: السطر/العمود */
+    char right[64];
+    snprintf(right, sizeof(right), " %d:%d ", B.cy + 1, B.cx + 1);
+    int rlen = strlen(right);
+    if (screen_cols > rlen + 2)
+        mvprintw(0, screen_cols - rlen - 1, "%s", right);
+
+    attroff(COLOR_PAIR(C_TITLE) | A_BOLD);
 }
 
+/* ★ شريط الحالة الجديد */
+static void ui_draw_status(void) {
+    int y = screen_rows - 2;
+    attron(COLOR_PAIR(C_STATUS));
+    mvhline(y, 0, ' ', screen_cols);
+
+    char info[512];
+    int width = 0;
+    if (show_line_numbers) {
+        int digits = 1, n = B.numlines;
+        while (n >= 10) { digits++; n /= 10; }
+        width = digits + 1;
+    }
+
+    snprintf(info, sizeof(info),
+             " %s | %d سطر | %s | UTF-8 ",
+             B.modified ? "● معدّل" : "○ محفوظ",
+             B.numlines,
+             html_is_html_file() ? "HTML" : "نص");
+
+    mvprintw(y, 0, "%.*s", screen_cols, info);
+    attroff(COLOR_PAIR(C_STATUS));
+}
+
+/* ★ شريط المفاتيح الجديد */
+static void ui_draw_keys(void) {
+    int y = screen_rows - 1;
+    attron(COLOR_PAIR(C_KEYS));
+    mvhline(y, 0, ' ', screen_cols);
+
+    const char *keys = " ^X خروج  ^O حفظ  ^W بحث  ^T تصحيح  ^Z تراجع  ^G سطر  Tab إكمال  F1 مساعدة ";
+
+    if (status_msg[0]) {
+        attroff(COLOR_PAIR(C_KEYS));
+        attron(A_BOLD);
+        mvprintw(y, 0, " %.*s", screen_cols - 2, status_msg);
+        attroff(A_BOLD);
+        attron(COLOR_PAIR(C_KEYS));
+    } else {
+        int klen = strlen(keys);
+        if (klen <= screen_cols)
+            mvprintw(y, (screen_cols - klen) / 2, "%s", keys);
+        else
+            mvprintw(y, 0, "%.*s", screen_cols, keys);
+    }
+
+    attroff(COLOR_PAIR(C_KEYS));
+}
+
+/* ★ الرسم الرئيسي */
 static void ui_draw(void) {
     getmaxyx(stdscr, screen_rows, screen_cols);
+
+    int edit_top = 1;
+    int edit_bottom = screen_rows - 3;
+    int edit_height = edit_bottom - edit_top + 1;
+
     erase();
 
+    /* العنوان */
+    ui_draw_title();
+
+    /* حساب عرض أرقام الأسطر */
+    int num_width = 0;
+    if (show_line_numbers) {
+        int digits = 1, n = B.numlines;
+        while (n >= 10) { digits++; n /= 10; }
+        num_width = digits + 2;
+    }
+
+    /* رسم النص */
     Line *l = B.head;
     for (int i = 0; i < B.rowoff && l; i++)
         l = l->next;
 
-    int y = 0;
+    int y = edit_top;
     bool is_html = html_is_html_file();
+    int lineno = B.rowoff + 1;
 
-    while (l && y < screen_rows - 2) {
-        if (is_html)
-            draw_html_line(l->data, y, B.coloff);
-        else {
-            int len = strlen(l->data);
-            int x = -B.coloff;
-            for (int i = 0; i < len && x < screen_cols; i++) {
-                if (x >= 0) mvaddch(y, x, l->data[i]);
-                x++;
-            }
+    while (l && y <= edit_bottom) {
+        /* رقم السطر */
+        if (show_line_numbers) {
+            attron(COLOR_PAIR(C_LINE_NUM) | A_DIM);
+            char num[16];
+            snprintf(num, sizeof(num), "%*d ", num_width - 1, lineno);
+            mvprintw(y, 0, "%s", num);
+            attroff(COLOR_PAIR(C_LINE_NUM) | A_DIM);
         }
+
+        /* المحتوى */
+        if (is_html)
+            draw_html_line(l->data, y, B.coloff - num_width);
+        else
+            draw_plain_line(l->data, y, B.coloff - num_width);
+
         l = l->next;
         y++;
+        lineno++;
     }
 
+    /* شريط الحالة */
     ui_draw_status();
-    ui_draw_message();
-    ui_move_cursor();
+
+    /* شريط المفاتيح */
+    ui_draw_keys();
+
+    /* المؤشر */
+    int cy = B.cy - B.rowoff + edit_top;
+    int cx = B.cx - B.coloff + num_width;
+    if (cy < edit_top) cy = edit_top;
+    if (cy > edit_bottom) cy = edit_bottom;
+    if (cx < num_width) cx = num_width;
+    if (cx >= screen_cols) cx = screen_cols - 1;
+    move(cy, cx);
+
     refresh();
 }
 
-static void ui_move_cursor(void) {
-    int y = B.cy - B.rowoff;
-    int x = B.cx - B.coloff;
-    if (y < 0) y = 0;
-    if (y >= screen_rows - 2) y = screen_rows - 3;
-    if (x < 0) x = 0;
-    if (x >= screen_cols) x = screen_cols - 1;
-    move(y, x);
-}
-
 static void ui_scroll(void) {
-    int visible = screen_rows - 2;
+    int edit_height = screen_rows - 4;
 
     if (B.cy < B.rowoff) B.rowoff = B.cy;
-    if (B.cy >= B.rowoff + visible) B.rowoff = B.cy - visible + 1;
+    if (B.cy >= B.rowoff + edit_height) B.rowoff = B.cy - edit_height + 1;
+    if (B.rowoff < 0) B.rowoff = 0;
+
+    int num_width = show_line_numbers ? 6 : 0;
+    int visible = screen_cols - num_width;
 
     if (B.cx < B.coloff) B.coloff = B.cx;
-    if (B.cx >= B.coloff + screen_cols) B.coloff = B.cx - screen_cols + 1;
+    if (B.cx >= B.coloff + visible) B.coloff = B.cx - visible + 1;
+    if (B.coloff < 0) B.coloff = 0;
 }
+
+/* ============================================================ */
+/*                    الأوامر                                   */
+/* ============================================================ */
 
 static void do_save(void) {
     char fname[512];
@@ -844,10 +1025,9 @@ static void do_save(void) {
     curs_set(1);
     move(screen_rows - 1, 0);
     clrtoeol();
-    mvprintw(screen_rows - 1, 0, "اسم الملف: ");
+    mvprintw(screen_rows - 1, 0, " اسم الملف: ");
     getnstr(fname, sizeof(fname) - 1);
     noecho();
-    curs_set(1);
 
     if (strlen(fname) > 0)
         buffer_save(fname);
@@ -857,10 +1037,10 @@ static void do_exit(void) {
     if (B.modified) {
         move(screen_rows - 1, 0);
         clrtoeol();
-        attron(A_REVERSE);
+        attron(COLOR_PAIR(C_MODIFIED) | A_BOLD);
         mvprintw(screen_rows - 1, 0,
-                 "الملف معدّل! ^O للحفظ، ^X مرة أخرى للخروج بدون حفظ، أي مفتاح آخر للإلغاء");
-        attroff(A_REVERSE);
+                 " ⚠ الملف معدّل! ^O حفظ | ^X خروج بدون حفظ | أي مفتاح = إلغاء ");
+        attroff(COLOR_PAIR(C_MODIFIED) | A_BOLD);
         refresh();
 
         int c = getch();
@@ -872,10 +1052,9 @@ static void do_exit(void) {
 static void do_search(void) {
     char query[256];
     echo();
-    curs_set(1);
     move(screen_rows - 1, 0);
     clrtoeol();
-    mvprintw(screen_rows - 1, 0, "بحث: ");
+    mvprintw(screen_rows - 1, 0, " 🔍 بحث: ");
     getnstr(query, sizeof(query) - 1);
     noecho();
 
@@ -894,7 +1073,7 @@ static void do_search(void) {
             B.current = l;
             B.cx = found - l->data;
             B.cy = line_no;
-            snprintf(status_msg, sizeof(status_msg), "وُجد في السطر %d", line_no + 1);
+            set_status("✓ وُجد في السطر %d", line_no + 1);
             ui_scroll();
             return;
         }
@@ -909,22 +1088,21 @@ static void do_search(void) {
         if (l == start && wrapped) break;
     }
 
-    snprintf(status_msg, sizeof(status_msg), "لم يوجد: %s", query);
+    set_status("✗ لم يوجد: %s", query);
 }
 
 static void do_replace(void) {
     char find[128], repl[128];
     echo();
-    curs_set(1);
 
     move(screen_rows - 1, 0);
     clrtoeol();
-    mvprintw(screen_rows - 1, 0, "ابحث عن: ");
+    mvprintw(screen_rows - 1, 0, " ابحث عن: ");
     getnstr(find, sizeof(find) - 1);
 
     move(screen_rows - 1, 0);
     clrtoeol();
-    mvprintw(screen_rows - 1, 0, "استبدل بـ: ");
+    mvprintw(screen_rows - 1, 0, " استبدل بـ: ");
     getnstr(repl, sizeof(repl) - 1);
     noecho();
 
@@ -948,16 +1126,15 @@ static void do_replace(void) {
     }
 
     B.modified = (count > 0);
-    snprintf(status_msg, sizeof(status_msg), "تم استبدال %d حالة", count);
+    set_status("✓ تم استبدال %d حالة", count);
 }
 
 static void do_goto_line(void) {
     char buf[32];
     echo();
-    curs_set(1);
     move(screen_rows - 1, 0);
     clrtoeol();
-    mvprintw(screen_rows - 1, 0, "اذهب إلى سطر: ");
+    mvprintw(screen_rows - 1, 0, " → اذهب إلى سطر: ");
     getnstr(buf, sizeof(buf) - 1);
     noecho();
 
@@ -972,29 +1149,48 @@ static void do_goto_line(void) {
         B.cy = i;
         B.cx = 0;
         ui_scroll();
-        snprintf(status_msg, sizeof(status_msg), "السطر %d", i + 1);
+        set_status("✓ السطر %d", i + 1);
     }
 }
 
 static void do_help(void) {
     erase();
-    attron(A_BOLD);
-    mvprintw(1, 2, "=== %s %s — المساعدة ===", APP_NAME, APP_VERSION);
-    attroff(A_BOLD);
-    mvprintw(3, 2, "^X    خروج");
-    mvprintw(4, 2, "^O    حفظ");
-    mvprintw(5, 2, "^W    بحث");
-    mvprintw(6, 2, "^\\    بحث واستبدال (Ctrl+\\)");
-    mvprintw(7, 2, "^G    اذهب إلى سطر");
-    mvprintw(8, 2, "^T    تصحيح إملائي");
-    mvprintw(9, 2, "^Z    تراجع");
-    mvprintw(10, 2, "^Y    إعادة");
-    mvprintw(11, 2, "^K    قطع السطر");
-    mvprintw(12, 2, "^U    لصق");
-    mvprintw(13, 2, "^C    موقع المؤشر");
-    mvprintw(14, 2, "Tab   إكمال وسم HTML (في ملفات .html)");
-    mvprintw(15, 2, "F2    إدراج هيكل HTML5 كامل");
-    mvprintw(17, 2, "اضغط أي مفتاح للعودة...");
+    int w = screen_cols - 4;
+    if (w > 60) w = 60;
+    int x = (screen_cols - w) / 2;
+    if (x < 2) x = 2;
+
+    attron(COLOR_PAIR(C_TITLE) | A_BOLD);
+    mvhline(1, x, ' ', w);
+    mvprintw(1, x + 2, " %s v%s — المساعدة ", APP_NAME, APP_VERSION);
+    attroff(COLOR_PAIR(C_TITLE) | A_BOLD);
+
+    const char *lines[] = {
+        "",
+        "  ^X    خروج",
+        "  ^O    حفظ",
+        "  ^W    بحث",
+        "  ^\\    بحث واستبدال",
+        "  ^G    اذهب إلى سطر",
+        "  ^T    تصحيح إملائي",
+        "  ^Z    تراجع",
+        "  ^Y    إعادة",
+        "  ^K    قطع السطر",
+        "  ^U    لصق",
+        "  ^C    موقع المؤشر",
+        "  ^L    إظهار/إخفاء أرقام الأسطر",
+        "  Tab   إكمال وسم HTML",
+        "  F2    إدراج هيكل HTML5",
+        "",
+        "  اضغط أي مفتاح للعودة...",
+        NULL
+    };
+
+    int y = 3;
+    for (int i = 0; lines[i]; i++) {
+        mvprintw(y++, x + 2, "%s", lines[i]);
+    }
+
     refresh();
     getch();
     flushinp();
@@ -1007,44 +1203,65 @@ static void do_cut_line(void) {
     B.current->data[0] = '\0';
     B.cx = 0;
     B.modified = true;
-    snprintf(status_msg, sizeof(status_msg), "✂ تم قطع السطر");
+    set_status("✂ تم قطع السطر");
 }
 
 static void do_paste(void) {
     if (!clipboard) {
-        snprintf(status_msg, sizeof(status_msg), "لا يوجد شيء للصق");
+        set_status("⚠ لا يوجد شيء للصق");
         return;
     }
     buffer_insert_string(clipboard);
-    snprintf(status_msg, sizeof(status_msg), "✓ تم اللصق");
+    set_status("✓ تم اللصق");
 }
 
 static void do_cursor_info(void) {
-    snprintf(status_msg, sizeof(status_msg),
-             "السطر %d، العمود %d، المجموع %d سطر",
-             B.cy + 1, B.cx + 1, B.numlines);
+    set_status("📍 السطر %d، العمود %d، المجموع %d سطر",
+               B.cy + 1, B.cx + 1, B.numlines);
 }
+
+static void do_toggle_numbers(void) {
+    show_line_numbers = !show_line_numbers;
+    set_status("%s أرقام الأسطر", show_line_numbers ? "✓" : "✗");
+}
+
+/* ============================================================ */
+/*                    معالجة المفاتيح                           */
+/* ============================================================ */
 
 static void process_key(int c) {
     switch (c) {
-        case 24: do_exit(); break;
-        case 15: do_save(); break;
-        case 23: do_search(); break;
-        case 28: do_replace(); break;
-        case 7:  do_goto_line(); break;
-        case 20: do_spell_check(); break;
-        case 26: do_undo(); break;
-        case 25: do_redo(); break;
-        case 11: do_cut_line(); break;
-        case 21: do_paste(); break;
-        case 3:  do_cursor_info(); break;
+        /* ★ Enter بكل أشكاله */
+        case '\n':
+        case '\r':
+        case KEY_ENTER:
+        case 10:
+        case 13:
+            buffer_insert_newline();
+            break;
+
+        case 24: do_exit(); break;             /* ^X */
+        case 15: do_save(); break;             /* ^O */
+        case 23: do_search(); break;           /* ^W */
+        case 28: do_replace(); break;          /* ^\ */
+        case 7:  do_goto_line(); break;        /* ^G */
+        case 20: do_spell_check(); break;      /* ^T */
+        case 26: do_undo(); break;             /* ^Z */
+        case 25: do_redo(); break;             /* ^Y */
+        case 11: do_cut_line(); break;         /* ^K */
+        case 21: do_paste(); break;            /* ^U */
+        case 3:  do_cursor_info(); break;      /* ^C */
+        case 12: do_toggle_numbers(); break;   /* ^L */
+
         case '\t':
             if (!html_complete())
                 for (int i = 0; i < TAB_SIZE; i++)
                     buffer_insert_char(' ');
             break;
+
         case KEY_F(1): do_help(); break;
         case KEY_F(2): html_insert_skeleton(); break;
+
         case KEY_UP:
             if (B.current->prev) {
                 B.current = B.current->prev;
@@ -1053,6 +1270,7 @@ static void process_key(int c) {
                 if (B.cx > len) B.cx = len;
             }
             break;
+
         case KEY_DOWN:
             if (B.current->next) {
                 B.current = B.current->next;
@@ -1061,6 +1279,7 @@ static void process_key(int c) {
                 if (B.cx > len) B.cx = len;
             }
             break;
+
         case KEY_LEFT:
             if (B.cx > 0) B.cx--;
             else if (B.current->prev) {
@@ -1069,6 +1288,7 @@ static void process_key(int c) {
                 B.cx = strlen(B.current->data);
             }
             break;
+
         case KEY_RIGHT:
             if (B.cx < (int)strlen(B.current->data)) B.cx++;
             else if (B.current->next) {
@@ -1077,31 +1297,38 @@ static void process_key(int c) {
                 B.cx = 0;
             }
             break;
+
         case KEY_HOME: B.cx = 0; break;
-        case KEY_END: B.cx = strlen(B.current->data); break;
+        case KEY_END:  B.cx = strlen(B.current->data); break;
+
         case KEY_PPAGE:
-            for (int i = 0; i < screen_rows - 2 && B.current->prev; i++) {
+            for (int i = 0; i < screen_rows - 4 && B.current->prev; i++) {
                 B.current = B.current->prev;
                 B.cy--;
             }
             break;
+
         case KEY_NPAGE:
-            for (int i = 0; i < screen_rows - 2 && B.current->next; i++) {
+            for (int i = 0; i < screen_rows - 4 && B.current->next; i++) {
                 B.current = B.current->next;
                 B.cy++;
             }
             break;
+
         case KEY_BACKSPACE:
         case 127:
         case 8:
             buffer_backspace();
             break;
+
         case KEY_DC:
             buffer_delete_char();
             break;
+
         case KEY_RESIZE:
             getmaxyx(stdscr, screen_rows, screen_cols);
             break;
+
         default:
             if (c >= 32 && c < 127)
                 buffer_insert_char(c);
@@ -1111,21 +1338,13 @@ static void process_key(int c) {
     ui_scroll();
 }
 
+/* ============================================================ */
+/*                    main                                      */
+/* ============================================================ */
+
 static void handle_sigint(int sig) {
     (void)sig;
     running = false;
-}
-
-static void init_colors(void) {
-    if (has_colors()) {
-        start_color();
-        use_default_colors();
-        init_pair(COLOR_TAG,    COLOR_CYAN,   -1);
-        init_pair(COLOR_ATTR,   COLOR_YELLOW, -1);
-        init_pair(COLOR_STRING, COLOR_GREEN,  -1);
-        init_pair(COLOR_COMMENT,COLOR_BLUE,   -1);
-        init_pair(COLOR_MATCH,  COLOR_BLACK,  COLOR_YELLOW);
-    }
 }
 
 int main(int argc, char **argv) {
@@ -1136,6 +1355,7 @@ int main(int argc, char **argv) {
     initscr();
     raw();
     noecho();
+    nonl();                     /* ★ مهم لـ Enter */
     keypad(stdscr, TRUE);
     curs_set(1);
     init_colors();
@@ -1148,14 +1368,10 @@ int main(int argc, char **argv) {
 
     spell_init();
 
-    if (argc > 1) {
+    if (argc > 1)
         buffer_load(argv[1]);
-    } else {
-        B.filename[0] = '\0';
-    }
 
-    snprintf(status_msg, sizeof(status_msg),
-             "%s %s — F1 للمساعدة", APP_NAME, APP_VERSION);
+    set_status("مرحباً بك في %s v%s — اضغط F1 للمساعدة", APP_NAME, APP_VERSION);
 
     while (running) {
         ui_draw();
