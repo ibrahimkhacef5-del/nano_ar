@@ -1,5 +1,5 @@
 /**************************************************************************
- *  nano-ar v2.0 — محرر نصوص عربي لـ Termux                             *
+ *  nano-ar v2.1 — محرر نصوص عربي لـ Termux و Linux                     *
  *  واجهة محدثة + Enter يعمل + تلوين + تصحيح + إكمال HTML                *
  *  الرخصة: MIT                                                          *
  **************************************************************************/
@@ -23,7 +23,7 @@
 /* ============================================================ */
 
 #define APP_NAME     "nano-ar"
-#define APP_VERSION  "2.0.0"
+#define APP_VERSION  "2.1.0"
 #define TAB_SIZE     4
 #define MAX_LINE     4096
 #define UNDO_MAX     200
@@ -36,9 +36,8 @@
 #define C_COMMENT    5
 #define C_STATUS     6
 #define C_KEYS       7
-#define C_FRAME      8
-#define C_LINE_NUM   9
-#define C_MODIFIED  10
+#define C_LINE_NUM   8
+#define C_MODIFIED   9
 
 /* ============================================================ */
 /*                       الهياكل                                */
@@ -319,7 +318,6 @@ static void do_redo(void) {
 /*                    عمليات التحرير                            */
 /* ============================================================ */
 
-/* ★ دالة السطر الجديد — مُصلَحة */
 static void buffer_insert_newline(void) {
     Line *l = B.current;
     char *right = xstrdup(l->data + B.cx);
@@ -343,8 +341,8 @@ static void buffer_insert_newline(void) {
 }
 
 static void buffer_insert_char(int c) {
-    /* ★ معالجة Enter بكل أشكاله */
-    if (c == '\n' || c == '\r' || c == KEY_ENTER || c == 10 || c == 13) {
+    /* ★ معالجة Enter بكل أشكاله — بدون تكرار */
+    if (c == '\n' || c == '\r' || c == KEY_ENTER) {
         buffer_insert_newline();
         return;
     }
@@ -759,7 +757,7 @@ static void html_insert_skeleton(void) {
 }
 
 /* ============================================================ */
-/*                    ★★★ واجهة جديدة ★★★                      */
+/*                    الواجهة                                   */
 /* ============================================================ */
 
 static void init_colors(void) {
@@ -773,13 +771,11 @@ static void init_colors(void) {
         init_pair(C_COMMENT,   COLOR_BLUE,   -1);
         init_pair(C_STATUS,    COLOR_BLACK,  COLOR_WHITE);
         init_pair(C_KEYS,      COLOR_WHITE,  COLOR_BLUE);
-        init_pair(C_FRAME,     COLOR_CYAN,   -1);
         init_pair(C_LINE_NUM,  COLOR_YELLOW, -1);
         init_pair(C_MODIFIED,  COLOR_RED,    -1);
     }
 }
 
-/* رسم سطر HTML بتلوين */
 static void draw_html_line(const char *data, int y, int xoff) {
     int x = -xoff;
     bool in_tag = false;
@@ -830,7 +826,6 @@ static void draw_html_line(const char *data, int y, int xoff) {
     }
 }
 
-/* رسم سطر عادي */
 static void draw_plain_line(const char *data, int y, int xoff) {
     int len = strlen(data);
     int x = -xoff;
@@ -840,17 +835,14 @@ static void draw_plain_line(const char *data, int y, int xoff) {
     }
 }
 
-/* ★ شريط العنوان الجديد */
 static void ui_draw_title(void) {
     attron(COLOR_PAIR(C_TITLE) | A_BOLD);
     mvhline(0, 0, ' ', screen_cols);
 
-    /* يسار: اسم التطبيق */
     char left[128];
     snprintf(left, sizeof(left), " %s v%s ", APP_NAME, APP_VERSION);
     mvprintw(0, 0, "%s", left);
 
-    /* وسط: اسم الملف */
     const char *fname = B.filename[0] ? B.filename : "[بدون اسم]";
     int flen = strlen(fname);
     int fx = (screen_cols - flen - 3) / 2;
@@ -866,7 +858,6 @@ static void ui_draw_title(void) {
         }
     }
 
-    /* يمين: السطر/العمود */
     char right[64];
     snprintf(right, sizeof(right), " %d:%d ", B.cy + 1, B.cx + 1);
     int rlen = strlen(right);
@@ -876,20 +867,12 @@ static void ui_draw_title(void) {
     attroff(COLOR_PAIR(C_TITLE) | A_BOLD);
 }
 
-/* ★ شريط الحالة الجديد */
 static void ui_draw_status(void) {
     int y = screen_rows - 2;
     attron(COLOR_PAIR(C_STATUS));
     mvhline(y, 0, ' ', screen_cols);
 
     char info[512];
-    int width = 0;
-    if (show_line_numbers) {
-        int digits = 1, n = B.numlines;
-        while (n >= 10) { digits++; n /= 10; }
-        width = digits + 1;
-    }
-
     snprintf(info, sizeof(info),
              " %s | %d سطر | %s | UTF-8 ",
              B.modified ? "● معدّل" : "○ محفوظ",
@@ -900,7 +883,6 @@ static void ui_draw_status(void) {
     attroff(COLOR_PAIR(C_STATUS));
 }
 
-/* ★ شريط المفاتيح الجديد */
 static void ui_draw_keys(void) {
     int y = screen_rows - 1;
     attron(COLOR_PAIR(C_KEYS));
@@ -925,20 +907,16 @@ static void ui_draw_keys(void) {
     attroff(COLOR_PAIR(C_KEYS));
 }
 
-/* ★ الرسم الرئيسي */
 static void ui_draw(void) {
     getmaxyx(stdscr, screen_rows, screen_cols);
 
     int edit_top = 1;
     int edit_bottom = screen_rows - 3;
-    int edit_height = edit_bottom - edit_top + 1;
 
     erase();
 
-    /* العنوان */
     ui_draw_title();
 
-    /* حساب عرض أرقام الأسطر */
     int num_width = 0;
     if (show_line_numbers) {
         int digits = 1, n = B.numlines;
@@ -946,7 +924,6 @@ static void ui_draw(void) {
         num_width = digits + 2;
     }
 
-    /* رسم النص */
     Line *l = B.head;
     for (int i = 0; i < B.rowoff && l; i++)
         l = l->next;
@@ -956,7 +933,6 @@ static void ui_draw(void) {
     int lineno = B.rowoff + 1;
 
     while (l && y <= edit_bottom) {
-        /* رقم السطر */
         if (show_line_numbers) {
             attron(COLOR_PAIR(C_LINE_NUM) | A_DIM);
             char num[16];
@@ -965,7 +941,6 @@ static void ui_draw(void) {
             attroff(COLOR_PAIR(C_LINE_NUM) | A_DIM);
         }
 
-        /* المحتوى */
         if (is_html)
             draw_html_line(l->data, y, B.coloff - num_width);
         else
@@ -976,13 +951,9 @@ static void ui_draw(void) {
         lineno++;
     }
 
-    /* شريط الحالة */
     ui_draw_status();
-
-    /* شريط المفاتيح */
     ui_draw_keys();
 
-    /* المؤشر */
     int cy = B.cy - B.rowoff + edit_top;
     int cx = B.cx - B.coloff + num_width;
     if (cy < edit_top) cy = edit_top;
@@ -1155,14 +1126,10 @@ static void do_goto_line(void) {
 
 static void do_help(void) {
     erase();
-    int w = screen_cols - 4;
-    if (w > 60) w = 60;
-    int x = (screen_cols - w) / 2;
-    if (x < 2) x = 2;
 
     attron(COLOR_PAIR(C_TITLE) | A_BOLD);
-    mvhline(1, x, ' ', w);
-    mvprintw(1, x + 2, " %s v%s — المساعدة ", APP_NAME, APP_VERSION);
+    mvhline(1, 2, ' ', screen_cols - 4);
+    mvprintw(1, 4, " %s v%s — المساعدة ", APP_NAME, APP_VERSION);
     attroff(COLOR_PAIR(C_TITLE) | A_BOLD);
 
     const char *lines[] = {
@@ -1188,7 +1155,7 @@ static void do_help(void) {
 
     int y = 3;
     for (int i = 0; lines[i]; i++) {
-        mvprintw(y++, x + 2, "%s", lines[i]);
+        mvprintw(y++, 4, "%s", lines[i]);
     }
 
     refresh();
@@ -1231,12 +1198,10 @@ static void do_toggle_numbers(void) {
 
 static void process_key(int c) {
     switch (c) {
-        /* ★ Enter بكل أشكاله */
+        /* ★ Enter — بدون تكرار لأن '\n' = 10 و '\r' = 13 */
         case '\n':
         case '\r':
         case KEY_ENTER:
-        case 10:
-        case 13:
             buffer_insert_newline();
             break;
 
